@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF，检出到 Windows 时自动转 CRLF
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.pyw text eol=lf
+*.lnk -text
+LICENSE text eol=lf

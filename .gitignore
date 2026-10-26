@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 探测阶段临时产物（每次运行会重新生成）
+_icon_preview/
+_panel_preview/
+
+# Solaar 参考源码：GPL v2，仅本地对照用，不入库（避免污染本项目的许可）
+_ref/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 本机绝对路径痕迹（如果以后有生成物）
+*.lnk
