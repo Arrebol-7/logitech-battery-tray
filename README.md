@@ -2,11 +2,14 @@
 
 **Windows 任务栏电量和桌面面板，直接读罗技 LIGHTSPEED 接收器的电量 —— 纯 Python 标准库 + ctypes，零第三方依赖，不需要装罗技 G HUB。**
 
-实测设备：罗技 GPW2（G PRO X SUPERLIGHT）无线鼠标 + `046D:C547` LIGHTSPEED 接收器。
+**自动检测**：插入罗技接收器后按协议自动识别（不挑型号、不用改代码），
+自动扫描配对设备所在槽位并匹配，设备名直接从硬件实读。
+
+实测设备：罗技 GPW2（G PRO X SUPERLIGHT 2 SE）无线鼠标 + `046D:C547` LIGHTSPEED 接收器。
 
 ```
 python my_devices.py --once
-GPW2 无线鼠标: 50%  [放电中]
+PRO X SUPERLIGHT 2 SE: 50%  [放电中]
 ```
 
 ## 为什么用它
@@ -97,9 +100,9 @@ python my_devices.py --remove-shortcuts    # 删除桌面链接
 
 | 形态 | 命令 | 说明 |
 |---|---|---|
-| **简洁面板** | `python my_devices.py` | 深色卡片 + **彩色圆环电量表**（12 点起顺时针填充），环内大号数字，环下状态；右侧为设备名 / 状态徽章 / 读取方式 / 电池等级 / 接收器固件；色阶 ≥60 绿 · 30–59 黄 · <30 红 · 充电中青；默认每 60 秒自动刷新 |
-| **托盘常驻** | `python my_devices.py --tray` | 通知区域图标为**圆环 + 电量数字**（与面板同色阶，按系统 DPI 渲染，150% 缩放下取 24px 不糊）；左键刷新、右键开面板、悬停显示「设备名：电量（更新时间）」 |
-| **调试版** | `python my_devices.py --debug` | 打印接口枚举、协议响应原始字节、特性索引、固件版本等完整诊断 |
+| **简洁面板** | `python my_devices.py` | 深色卡片 + **彩色圆环电量表**（12 点起顺时针填充），环内大号数字，环下状态；右侧为设备名 / 状态徽章 / 读取方式 / 槽位 / 电池等级 / 接收器固件；色阶 ≥60 绿 · 30–59 黄 · <30 红 · 充电中青；默认每 60 秒自动刷新。**卡片随插拔动态增删**，底部「重新检测」可随时强制重扫 |
+| **托盘常驻** | `python my_devices.py --tray` | 通知区域图标为**圆环 + 电量数字**（取电量最低的设备，与面板同色阶，按系统 DPI 渲染）；左键刷新、右键开面板、悬停显示「设备名：电量（更新时间）」；**接收器插拔自动感知**（WM_DEVICECHANGE 触发重扫） |
+| **调试版** | `python my_devices.py --debug` | 打印自动发现过程、逐槽位扫描结果、协议响应原始字节、特性索引、固件版本等完整诊断 |
 
 面板外观集中在 `ui_theme.py`（配色常量 + `BatteryRing` 圆环控件 + `Card` / `flat_button`），改风格只动这一个文件。
 
@@ -157,9 +160,9 @@ python my_devices.py --remove-shortcuts    # 删除桌面链接
 
 | 文件 | 作用 |
 |---|---|
-| `my_devices.py` | 主程序，三种形态 + CLI 参数 + 面板单实例 |
+| `my_devices.py` | 主程序，三种形态 + 自动发现/缓存 + CLI 参数 + 面板单实例 |
 | `ui_theme.py` | **界面外观**：深色配色常量、`BatteryRing` 圆环电量控件、`Card` 卡片、扁平按钮 |
-| `hidpp.py` | **核心**：HID 设备打开、HID++ 1.0/2.0 协议、电量读取 |
+| `hidpp.py` | **核心**：HID 设备打开、HID++ 1.0/2.0 协议、电量读取、接收器发现与槽位扫描 |
 | `tray.py` | 托盘实现（纯 ctypes 手写 `Shell_NotifyIconW` + GDI 画图标 + 单实例锁） |
 | `shell.py` | 纯 ctypes：创建 `.lnk` 快捷方式 与 桌面真链接（符号链接/junction/硬链接） |
 | `start_tray.pyw` | 开机自启入口（无控制台） |
@@ -173,18 +176,36 @@ python my_devices.py --remove-shortcuts    # 删除桌面链接
 
 ---
 
+## 自动检测原理
+
+不再硬编码 VID:PID / 槽位，三层都是动态的：
+
+1. **接收器发现**：枚举 046D 全部 HID 接口，对每个 mi_02&col01 短报文通道
+   试一次 1.0 固件寄存器交换（`10 FF 81 F1`）——能应答的就是接收器。
+   键盘 / 鼠标本体的接口要么打不开要么不应答，天然被排除。
+2. **槽位扫描**：对 col02 长报文通道逐槽位（1~6）发 HID++ 2.0 root.ping，
+   应答的槽位 = 在线设备；空槽完全静默。首个在线槽位作为工作槽位。
+3. **设备识别**：实读 `0x0005 FRIENDLY_NAME` 得到真实设备名
+   （如 "PRO X SUPERLIGHT 2 SE"），失败时回退 `0x0003`。
+
+发现结果有缓存（避免每轮刷新都全扫描）；空结果 10 秒过期自动重扫，
+所以**先开工具再插接收器也能自动出现**。托盘还会监听
+`WM_DEVICECHANGE`，插拔接收器立即触发重扫。
+
 ## 适配其他设备
 
-代码目前**硬编码了 GPW2 + `046D:C547` 接收器**。要换成别的罗技设备：
+协议层已做到**免配置自动识别**，无需改代码。当前仅在下列设备上实测：
 
-1. 用 `python my_devices.py --debug` 看你的接收器 **Product ID**（`VID:PID`）
-2. 改 `hidpp.py` 里的默认 VID/PID
-3. `python my_devices.py --once` 验证；读不到就看 `probes/probe_hid.py`
-   打印出的接口列表，确认报文长度分到哪个通道
+- `046D:C547` LIGHTSPEED 接收器 + GPW2 鼠标（槽位 1）
 
-大部分近年的罗技 LIGHTSPEED 设备都实现了 `0x1004 UNIFIED_BATTERY`，
-协议层不用动，通常只改 VID/PID 就能用。USB 接收器（短报文）和蓝牙直连
-（走 HID++ over BLE）的通道细节不同，蓝牙场景需要调整通道选择逻辑。
+其它罗技接收器（Unifying `C52B`、Bolt `C548` 等）理论上同样适配——
+发现靠协议应答而非 PID 白名单——但**未逐一实测**。若某型号不工作：
+
+1. `python my_devices.py --debug` 看自动发现与逐槽位扫描输出
+2. 若接收器没被识别：跑 `python probes/probe_discovery.py`，
+   看它的 col01 是否应答固件寄存器交换
+3. USB 接收器（短报文）和蓝牙直连（HID++ over BLE）的通道细节不同，
+   蓝牙场景需要调整通道选择逻辑
 
 ---
 

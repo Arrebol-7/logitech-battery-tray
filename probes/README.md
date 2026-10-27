@@ -27,6 +27,8 @@ python probes/probe_batfn.py
 | `probe_final.py` | 走 `root.getFeature` 查 0x1004 | 设备自报 feature_index = `0x06` |
 | `probe_confirm.py` | 用 fn0 读电量 | ⚠️ **读到 15%，是错的** |
 | `probe_batfn.py` | 核对 fn0/fn1 语义 | ✅ 正解是 **fn1** `get_battery_info`：`32 04 00` = 50% / level 4 / 放电中 |
+| `probe_discovery.py` | 无 PID 白名单找接收器 + 逐槽位 ping + 读名字 | 固件交换唯一识别接收器；槽 1 在线；0x0005 = 设备名 |
+| `probe_name.py` | 对照 0x0003 / 0x0005 的原始字节 | 0x0003 是序列号信息；**0x0005 = "PRO X SUPERLIGHT 2 SE"**；错误响应 `r[2]=0xFF` |
 
 ## 最容易踩的两个坑
 

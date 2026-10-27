@@ -21,6 +21,7 @@ import ctypes
 import os
 import sys
 import threading
+import time
 from ctypes import POINTER, WINFUNCTYPE, byref, c_void_p, c_wchar_p, wintypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +42,8 @@ WM_COPYDATA = 0x004A
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
 WM_TIMER = 0x0113
+WM_DEVICECHANGE = 0x0219
+DBT_DEVNODES_CHANGED = 0x0007
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -407,6 +410,7 @@ class Tray:
         self._wndproc_ref = None
         self.class_name = WINDOW_CLASS
         self._stopping = False
+        self._last_rescan = 0.0           # WM_DEVICECHANGE 防抖
 
     # -- 窗口 --
     def _register_class(self):
@@ -443,6 +447,17 @@ class Tray:
             return 0
         if msg == WM_TIMER:
             self.refresh()
+            return 0
+        if msg == WM_DEVICECHANGE:
+            # 接收器插拔：防抖后强制重扫（USB 枚举会连发多条事件）
+            if wparam == DBT_DEVNODES_CHANGED and time.time() - self._last_rescan > 2:
+                self._last_rescan = time.time()
+                from my_devices import rescan_devices
+                try:
+                    rescan_devices()
+                except Exception:               # noqa: BLE001
+                    pass
+                self.refresh()
             return 0
         if msg == WM_DESTROY:
             # §四.3：不 PostQuitMessage 会留僵尸进程 + 占着单实例锁
@@ -483,7 +498,8 @@ class Tray:
     def _update_icon(self, rows):
         pct, chg = None, False
         if rows:
-            r = rows[0]
+            r = min(rows, key=lambda x: (x["percent"] is None,
+                                         x["percent"] if x["percent"] is not None else 0))
             pct, chg = r["percent"], r["charging"]
         new_icon = make_icon(pct, chg)
         old_icon = self.icon
@@ -501,7 +517,15 @@ class Tray:
         stamp = (self.last_update.strftime("%H:%M:%S")
                  if self.last_update else "尚未更新")
         if not rows:
-            return f"无线外设电量：读取失败 —— 动一下鼠标（{stamp}）"
+            recvs = []
+            try:
+                from my_devices import receivers_seen
+                recvs = receivers_seen()
+            except Exception:                   # noqa: BLE001
+                pass
+            if recvs:
+                return f"无线外设电量：接收器在线，设备休眠 —— 动一下鼠标（{stamp}）"
+            return f"无线外设电量：未检测到 2.4G 接收器（{stamp}）"
         parts = []
         for r in rows:
             p = f"{r['percent']}%" if r["percent"] is not None else r["level_text"]

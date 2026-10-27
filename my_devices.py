@@ -31,9 +31,14 @@ STARTUP_SCRIPT = os.path.join(HERE, "start_tray.pyw")
 DEFAULT_INTERVAL = 60
 MIN_INTERVAL, MAX_INTERVAL = 30, 1800
 
-DEVICES = [
-    {"key": "gpw2", "name": "GPW2 无线鼠标", "vid": 0x046D, "pid": 0xC547},
-]
+# 自动检测：设备清单不再硬编码 —— 插入 2.4G 接收器后按协议识别并自动匹配。
+# 缓存策略：发现结果缓存（避免每轮刷新都做 5s 全扫描）；空结果 10s 过期，
+# 所以「启动时没插、后来插上」也能在下一轮刷新自动出现。
+RESCAN_EXPIRE = 10.0
+_RECEIVER_CACHE = None
+_RECEIVER_CACHE_AT = 0.0
+_DEV_KEY_SEQ = 0
+_LAST_RECEIVERS = []      # 最近一次扫描见到的接收器 [(vid, pid, fw)]，与在线无关
 
 DEBUG = False
 
@@ -44,23 +49,80 @@ def log(msg):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ---------------------------------------------------------------- 自动发现
+def discover_devices(rescan=False):
+    """自动检测连入的 2.4G 接收器与在线设备，返回设备信息列表。
+
+    - 无 PID 白名单：1.0 固件寄存器应答的接口 = 接收器（协议识别）
+    - col02 逐槽位 root.ping 找在线设备，设备名用 FRIENDLY_NAME 实读
+    - 结果缓存；空结果 RESCAN_EXPIRE 秒后过期自动重扫（插上即自动出现）
+    """
+    global _RECEIVER_CACHE, _RECEIVER_CACHE_AT, _DEV_KEY_SEQ, _LAST_RECEIVERS
+    if rescan:
+        _RECEIVER_CACHE = None
+    if _RECEIVER_CACHE is not None and (
+            _RECEIVER_CACHE or time.time() - _RECEIVER_CACHE_AT < RESCAN_EXPIRE):
+        return _RECEIVER_CACHE
+    from hidpp import ReceiverBattery, discover_receivers, scan_slots
+    devs = []
+    recvs = []
+    for vid, pid, sp, lp, fw in discover_receivers():
+        recvs.append((vid, pid, fw))
+        b = ReceiverBattery()
+        if not b.open_paths(sp, lp):
+            log(f"接收器 {vid:04X}:{pid:04X} 打开失败: {b.last_error}")
+            continue
+        try:
+            hits = [s for s, resp in scan_slots(b.long).items() if resp is not None]
+            b.online_slots = hits
+            for slot in hits:
+                b.slot = slot
+                name = b.read_device_name() or f"2.4G 设备（槽位 {slot}）"
+                _DEV_KEY_SEQ += 1
+                devs.append({"key": f"dev{_DEV_KEY_SEQ}", "name": name,
+                             "vid": vid, "pid": pid, "slot": slot,
+                             "short_path": sp, "long_path": lp, "firmware": fw})
+                log(f"发现设备: {name} @ {vid:04X}:{pid:04X} 槽位 {slot}")
+        finally:
+            b.close()
+    _LAST_RECEIVERS[:] = recvs
+    _RECEIVER_CACHE = devs
+    _RECEIVER_CACHE_AT = time.time()
+    return devs
+
+
+def receivers_seen():
+    """最近一次扫描见到的接收器（含下挂设备全部休眠的情况）。"""
+    discover_devices()
+    return list(_LAST_RECEIVERS)
+
+
+def rescan_devices():
+    """插拔接收器后强制重扫（托盘 WM_DEVICECHANGE / 面板「重新检测」调用）。"""
+    discover_devices(rescan=True)
+
+
 # ---------------------------------------------------------------- 读取
 def read_one(dev):
-    """读一台设备的电量，返回 dict 或 None。"""
-    from hidpp import Gpw2Battery
-    b = Gpw2Battery(dev["vid"], dev["pid"])
+    """读一台设备的电量，返回 dict 或 None。
+
+    dev 来自 discover_devices()：含接收器接口路径与槽位，不再依赖硬编码表。
+    """
+    from hidpp import ReceiverBattery
+    b = ReceiverBattery()
+    b.vid, b.pid, b.slot = dev["vid"], dev["pid"], dev["slot"]
     try:
-        if not b.open():
+        if not b.open_paths(dev["short_path"], dev["long_path"]):
             log(f"{dev['name']}: 打开失败 {b.last_error}")
             return None
         data = b.read_battery()
         if data is None:
             log(f"{dev['name']}: {b.last_error}")
             return None
-        fw = b.read_firmware()
+        fw = dev.get("firmware") or b.read_firmware()
         conn = b.read_connection_count()
         data.update({"key": dev["key"], "name": dev["name"],
-                     "firmware": fw, "connected": conn})
+                     "firmware": fw, "connected": conn, "slot": dev["slot"]})
         log(f"{dev['name']}: {data['percent']}% {data['state_text']} "
             f"level={data['level_text']} raw={data['raw']}")
         return data
@@ -68,8 +130,8 @@ def read_one(dev):
         b.close()
 
 
-def read_all():
-    return [d for d in (read_one(x) for x in DEVICES) if d]
+def read_all(rescan=False):
+    return [d for d in (read_one(x) for x in discover_devices(rescan)) if d]
 
 
 def color_for(pct):
@@ -98,18 +160,15 @@ def icon_color_for(pct):
 def cmd_once():
     rows = read_all()
     if not rows:
-        # 区分两种失败：接收器不在 / 设备休眠
-        from hidpp import Gpw2Battery
-        b = Gpw2Battery()
-        if not b.open():
-            print(f"未找到接收器（VID:PID = {DEVICES[0]['vid']:04X}:"
-                  f"{DEVICES[0]['pid']:04X}）—— 请确认已插入")
-            print(f"  详情: {b.last_error}")
+        # 区分两种失败：接收器不在 / 设备休眠（receivers_seen 由同一轮扫描填充）
+        recvs = receivers_seen()
+        if not recvs:
+            print("未检测到 2.4G 接收器 —— 请确认接收器已插入 USB 口")
+            print("  （罗技 046D 接收器自动识别，无需指定型号）")
         else:
-            fw = b.read_firmware()
-            print(f"接收器在线（固件 {fw}），但设备无响应。")
-            print("  → 请动一下鼠标唤醒后再试。")
-            b.close()
+            vids = ", ".join(f"{v:04X}:{p:04X}(固件 {fw})" for v, p, fw in recvs)
+            print(f"接收器在线：{vids}")
+            print("  但下挂设备无响应 → 请动一下鼠标唤醒后再试。")
         return 1
     for r in rows:
         chg = "（充电中）" if r["charging"] else ""
@@ -128,7 +187,10 @@ class Panel:
     信息层级（从上到下）:
         标题栏  设备名 + 实时状态徽章
         主体    圆环大号电量 + 状态/来源/固件明细
-        底栏    开机自启 · 刷新间隔 · 立即刷新 · 退出
+        底栏    开机自启 · 刷新间隔 · 立即刷新 · 重新检测 · 退出
+
+    设备卡片是动态的：自动检测到设备就建卡；设备休眠时卡片置灰保留；
+    接收器被拔出时对应卡片移除（WM_DEVICECHANGE / 「重新检测」触发重扫）。
     """
 
     def __init__(self):
@@ -154,7 +216,7 @@ class Panel:
     def _center(self):
         """居中显示（小屏上尤其重要）。"""
         self.root.update_idletasks()
-        w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+        w, h = self.root.winfo_reqwidth(), self.root.winfo_screenheight()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
         self.root.geometry(f"+{x}+{y}")
@@ -170,43 +232,14 @@ class Panel:
         head.pack(fill="x", pady=(0, 12))
         tk.Label(head, text="无线外设电量", bg=T.BG, fg=T.FG,
                  font=T.font(14, "bold")).pack(side="left")
-        self.stamp_lbl = tk.Label(head, text="尚未更新", bg=T.BG, fg=T.FG_FAINT,
-                                  font=T.font(9))
+        self.stamp_lbl = tk.Label(head, text="正在检测 2.4G 设备…", bg=T.BG,
+                                  fg=T.FG_FAINT, font=T.font(9))
         self.stamp_lbl.pack(side="right")
 
-        # —— 每台设备一张卡片
-        for dev in DEVICES:
-            card = T.Card(wrap)
-            card.pack(fill="x", pady=(0, 10))
-            body = card.inner
-            inner = tk.Frame(body, bg=T.CARD, padx=16, pady=14)
-            inner.pack(fill="both", expand=True)
-
-            # 左：圆环
-            ring = T.BatteryRing(inner, size=132, thickness=13)
-            ring.grid(row=0, column=0, rowspan=2)
-
-            # 右：设备名 + 状态徽章 + 明细
-            right = tk.Frame(inner, bg=T.CARD)
-            right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(16, 0))
-            inner.columnconfigure(1, weight=1)
-
-            tk.Label(right, text=dev["name"], bg=T.CARD, fg=T.FG,
-                     font=T.font(12, "bold"), anchor="w").pack(fill="x")
-
-            badge = tk.Label(right, text="读取中…", bg=T.CARD, fg=T.FG_DIM,
-                             font=T.font(9), anchor="w")
-            badge.pack(fill="x", pady=(3, 0))
-
-            T.hline(right).pack(fill="x", pady=(9, 9))
-
-            detail = tk.Label(right, text="数据来源 —", bg=T.CARD, fg=T.FG_DIM,
-                              font=T.font(8), anchor="w", justify="left",
-                              wraplength=190)
-            detail.pack(fill="x")
-
-            self.cards[dev["key"]] = {"ring": ring, "badge": badge,
-                                      "detail": detail, "name": dev["name"]}
+        # —— 设备卡片容器（卡片随检测结果动态增删）
+        self.card_host = tk.Frame(wrap, bg=T.BG)
+        self.card_host.pack(fill="both", expand=True)
+        self._prime_card()
 
         # —— 底栏设置
         bar = T.Card(wrap)
@@ -240,9 +273,61 @@ class Panel:
                  font=T.font(9)).pack(side="left", padx=(5, 0))
 
         T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right", padx=(6, 0))
+        T.flat_button(opt, "重新检测", lambda: self.refresh(rescan=True),
+                      kind="ghost").pack(side="right", padx=(6, 0))
         T.flat_button(opt, "立即刷新", self.refresh, kind="primary").pack(side="right")
 
         self._building = False
+
+    def _make_card(self, key, title):
+        """为设备 key 建一张卡片，返回卡片控件字典。"""
+        T = self.T
+        card = T.Card(self.card_host)
+        card.pack(fill="x", pady=(0, 10))
+        body = card.inner
+        inner = tk.Frame(body, bg=T.CARD, padx=16, pady=14)
+        inner.pack(fill="both", expand=True)
+
+        ring = T.BatteryRing(inner, size=132, thickness=13)
+        ring.grid(row=0, column=0, rowspan=2)
+
+        right = tk.Frame(inner, bg=T.CARD)
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(16, 0))
+        inner.columnconfigure(1, weight=1)
+
+        tk.Label(right, text=title, bg=T.CARD, fg=T.FG,
+                 font=T.font(12, "bold"), anchor="w").pack(fill="x")
+        title_lbl = right.winfo_children()[-1]
+
+        badge = tk.Label(right, text="读取中…", bg=T.CARD, fg=T.FG_DIM,
+                         font=T.font(9), anchor="w")
+        badge.pack(fill="x", pady=(3, 0))
+
+        T.hline(right).pack(fill="x", pady=(9, 9))
+
+        detail = tk.Label(right, text="数据来源 —", bg=T.CARD, fg=T.FG_DIM,
+                          font=T.font(8), anchor="w", justify="left",
+                          wraplength=190)
+        detail.pack(fill="x")
+
+        c = {"ring": ring, "badge": badge, "detail": detail, "name": title,
+             "title": title_lbl, "widget": card}
+        self.cards[key] = c
+        return c
+
+    def _prime_card(self):
+        """检测完成前的占位卡（避免 5 秒全扫描期白屏）。"""
+        self._make_card("_scan", "正在检测…")
+        self.cards["_scan"]["ring"].set_color(self.T.COLOR_UNKNOWN, "--", "扫描 HID")
+        self.cards["_scan"]["badge"].config(text="自动检测 2.4G 接收器与在线设备…")
+
+    def _drop_card(self, key):
+        c = self.cards.pop(key, None)
+        if c:
+            c["widget"].destroy()
+
+    def _drop_prime(self):
+        self._drop_card("_scan")
 
     def _on_autostart_click(self):
         """用户主动点勾选框时才写启动项 —— 程序自己绝不擅自改（§四.7）。"""
@@ -266,18 +351,19 @@ class Panel:
         self.interval = n * 60 if "分钟" in txt else n
         self.interval = max(MIN_INTERVAL, min(MAX_INTERVAL, self.interval))
 
-    def refresh(self):
+    def refresh(self, rescan=False):
         # 互斥：并发访问同一 HID 设备会让响应错位（实测读到 0x0F/充电将满 这种垃圾，
         # 甚至 CEOF）。正在读就直接跳过，等这一轮结束。
         if self._busy:
             return
         self._busy = True
         self.stamp_lbl.config(text="读取中…", fg=self.T.FG_FAINT)
-        threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._worker, args=(rescan,),
+                         daemon=True).start()
 
-    def _worker(self):
+    def _worker(self, rescan=False):
         try:
-            self.result_q.put(read_all())
+            self.result_q.put(read_all(rescan))
         except Exception as e:                     # noqa: BLE001
             self.result_q.put(e)
 
@@ -297,21 +383,40 @@ class Panel:
             self.stamp_lbl.config(text=f"读取异常: {rows}", fg=self.T.COLOR_LOW)
             return
         T = self.T
+        self._drop_prime()
         if not rows:
+            # 区分「接收器不在」和「设备休眠」：有接收器无在线设备 → 保留卡片置灰；
+            # 连接收器都没有 → 全部卡片移除，只留提示。
+            recv_present = bool(receivers_seen())
+            if not recv_present:
+                for key in list(self.cards):
+                    self._drop_card(key)
+                self.stamp_lbl.config(text=f"未检测到 2.4G 接收器 "
+                                           f"{time.strftime('%H:%M:%S')}",
+                                      fg=T.COLOR_MID)
+                self.root.after(self.interval * 1000, self.refresh)
+                return
+            if not self.cards:
+                c = self._make_card("_sleep", "2.4G 设备")
+                c["ring"].set_color(T.COLOR_UNKNOWN, "--", "休眠")
             for c in self.cards.values():
-                c["ring"].set_color(T.COLOR_UNKNOWN, "--", "无信号")
-                c["badge"].config(text="未读到设备 — 检查接收器 / 动一下鼠标",
+                c["ring"].set_color(T.COLOR_UNKNOWN, "--", "休眠")
+                c["badge"].config(text="● 设备未响应 — 检查开关 / 动一下鼠标",
                                   fg=T.COLOR_MID)
                 c["detail"].config(text="设备休眠时不响应请求，唤醒后会自动恢复。")
-            self.stamp_lbl.config(text=f"读取失败 {time.strftime('%H:%M:%S')}",
+            self.stamp_lbl.config(text=f"设备休眠 {time.strftime('%H:%M:%S')}",
                                   fg=T.COLOR_MID)
             self.root.after(self.interval * 1000, self.refresh)
             return
 
+        seen = set()
         for r in rows:
-            c = self.cards.get(r["key"])
+            key = r["key"]
+            seen.add(key)
+            c = self.cards.get(key)
             if not c:
-                continue
+                c = self._make_card(key, r["name"])
+            c["name"] = r["name"]
             pct, charging = r["percent"], r["charging"]
             color = T.pct_color(pct, charging)
 
@@ -332,11 +437,19 @@ class Panel:
 
             # 明细：说得像人话（"已连接设备 0" 会被误读成"没连上"，实际是
             # 接收器上报的通道计数，对 GPW2 单设备场景无意义）。
-            lines = [f"读取方式  HID++ 2.0 特性 0x1004（UNIFIED_BATTERY）",
+            lines = [f"读取方式  HID++ 2.0 特性 0x1004（UNIFIED_BATTERY）"
+                     f" · 槽位 {r.get('slot', '?')}",
                      f"电池等级  {r['level_text']}"]
             if r.get("firmware"):
                 lines.append(f"接收器固件  {r['firmware']}")
             c["detail"].config(text="\n".join(lines))
+            if c["title"]["text"] != r["name"]:
+                c["title"].config(text=r["name"])
+
+        # 拔出/消失的设备 → 移除卡片；占位卡一并清掉
+        for key in [k for k in self.cards
+                    if k not in seen and k not in ("_scan", "_sleep")]:
+            self._drop_card(key)
 
         self.stamp_lbl.config(text=f"更新于 {time.strftime('%H:%M:%S')}",
                               fg=T.FG_FAINT)
@@ -386,39 +499,46 @@ def open_panel_and_wait():
 
 # ---------------------------------------------------------------- 形态 3: --debug
 def cmd_debug():
-    from hidpp import list_interfaces, find_channels, Gpw2Battery
+    from hidpp import (list_interfaces, ReceiverBattery, discover_receivers,
+                       scan_slots)
     from shell import desktop_dir, link_kind, DIR_LINK_NAME, FILE_LINK_NAME
     print("=" * 74)
     print("完整调试版")
     print("=" * 74)
-    for dev in DEVICES:
-        print(f"\n### {dev['name']}  {dev['vid']:04X}:{dev['pid']:04X}")
-        paths = list_interfaces(dev["vid"], dev["pid"])
-        print(f"  HID 接口数: {len(paths)}")
-        for p in paths:
-            tag = p.split("#")[-1] if "#" in p else p
-            print(f"    - ...{tag[:60]}")
-        sp, lp = find_channels(dev["vid"], dev["pid"])
+    print("\n### 自动发现（无 PID 白名单，1.0 固件寄存器应答 = 接收器）")
+    for vid, pid, sp, lp, fw in discover_receivers():
+        n_if = len(list_interfaces(vid, pid))
+        print(f"\n  接收器 {vid:04X}:{pid:04X}  固件 {fw}  "
+              f"HID 接口 {n_if} 个")
         print(f"  col01(短报文 7B) = {'有' if sp else '无'}")
         print(f"  col02(长报文 20B) = {'有' if lp else '无'}")
-
-        b = Gpw2Battery(dev["vid"], dev["pid"])
-        if not b.open():
+        b = ReceiverBattery()
+        if not b.open_paths(sp, lp):
             print(f"  打开失败: {b.last_error}")
             continue
-        print(f"  接收器固件: {b.read_firmware()}")
-        print(f"  已连接设备数: {b.read_connection_count()}")
-        idx = b.resolve_battery_feature()
-        print(f"  UNIFIED_BATTERY(0x1004) feature_index = "
-              f"{('0x%02X' % idx) if idx else '未实现'}")
-        data = b.read_battery()
-        if data:
-            print(f"  电量: {data['percent']}%  状态: {data['state_text']}  "
-                  f"充电: {data['charging']}")
-            print(f"  原始响应: {data['raw']}")
-        else:
-            print(f"  读电量失败: {b.last_error}")
+        for slot, resp in scan_slots(b.long).items():
+            print(f"  槽位 {slot}: {'在线' if resp is not None else '—'}")
+            if resp is None:
+                continue
+            b.slot = slot
+            idx = b.resolve_battery_feature()
+            print(f"    设备名: {b.read_device_name() or '未知'}")
+            print(f"    UNIFIED_BATTERY(0x1004) feature_index = "
+                  f"{('0x%02X' % idx) if idx else '未实现'}")
+            data = b.read_battery()
+            if data:
+                print(f"    电量: {data['percent']}%  状态: {data['state_text']}  "
+                      f"充电: {data['charging']}")
+                print(f"    原始响应: {data['raw']}")
+            else:
+                print(f"    读电量失败: {b.last_error}")
         b.close()
+
+    devs = discover_devices()
+    print(f"\n### 汇总：{len(receivers_seen())} 台接收器，"
+          f"{len(devs)} 台在线设备")
+    for d in devs:
+        print(f"  {d['name']}  {d['vid']:04X}:{d['pid']:04X} 槽位 {d['slot']}")
 
     print("\n### 安装状态")
     print(f"  开机自启: {'已启用' if is_autostart_enabled() else '未启用'}")
