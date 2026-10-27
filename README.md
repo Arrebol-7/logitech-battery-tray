@@ -19,7 +19,19 @@ GPW2 无线鼠标: 50%  [放电中]
 
 ## 安装
 
-需要 **Windows 10/11** + **Python 3.8+**（含 tkinter，官方安装包默认自带）。
+需要 **Windows 10/11**。
+
+**方式 A：便携版 exe（不需要 Python）**
+
+去 [Releases](https://github.com/Arrebol-7/logitech-battery-tray/releases) 下载
+`LogitechBatteryTray.exe`（单文件，约 13 MB），双击即用：
+
+| 双击 | 效果 |
+|---|---|
+| `LogitechBatteryTray.exe` | 打开电量面板 |
+| `LogitechBatteryTray.exe --tray` | 托盘常驻（可给它在桌面建个快捷方式，参数写在「目标」栏） |
+
+**方式 B：源码运行**（需要 Python 3.8+，官方安装包默认自带 tkinter）
 
 ```bash
 git clone https://github.com/Arrebol-7/logitech-battery-tray.git
@@ -29,6 +41,18 @@ python my_devices.py --once     # 先确认能读到你的设备
 ```
 
 没有依赖要装，克隆下来就能跑。
+
+### 自己打包 exe（可选）
+
+```bash
+pip install pyinstaller
+python _make_ico.py             # 生成应用图标 app.ico（纯标准库画圆环）
+pyinstaller --noconfirm --clean --onefile --windowed \
+    --name LogitechBatteryTray --icon app.ico \
+    --hidden-import tray --hidden-import ui_theme \
+    --hidden-import shell --hidden-import hidpp my_devices.py
+# 产物在 dist/LogitechBatteryTray.exe
+```
 
 ## 启动方式
 
