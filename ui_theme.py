@@ -1,7 +1,8 @@
 """面板视觉主题 + 圆环电量表绘制（纯 tkinter Canvas，无第三方库）。
 
 设计目标：把原来朴素的 ttk 灰控件换成深色卡片 + 彩色圆环，接近手机电池 App。
-1280x720 小屏也能完整显示。
+面板 96 DPI 基准约 670x362（窗口不小于 460 逻辑宽），随系统 DPI 等比放大；
+1920x1080（150% 缩放）实测 1027x599 物理像素原生渲染，1280x720 小屏仍完整显示。
 
 配色（深色）:
     背景 #16181D   卡片 #1F2229   描边 #2B2F38
@@ -34,6 +35,23 @@ COLOR_CHARGING = "#4CC9F0"
 FONT = "Microsoft YaHei UI"
 FONT_FALLBACK = "Segoe UI"
 
+# ---- DPI 缩放 --------------------------------------------------------------
+# 字体用磅值会随系统 DPI 自动放大，但像素尺寸（圆环/内边距/组件画布）不会；
+# 150% 屏幕上就出现「字大、框小」的拥挤感（用户实测反馈）。
+# S = 物理 DPI / 96，Panel 创建窗口后调用 set_scaling() 注入，
+# 各组件构造时把像素尺寸乘 S。96 DPI 屏上 S=1，一切照旧。
+S = 1.0
+
+
+def set_scaling(root):
+    """按 root 所在屏幕的 DPI 计算像素缩放系数，须在构建界面之前调用。"""
+    global S
+    try:
+        S = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:                          # noqa: BLE001 — 取不到就按 1.0
+        S = 1.0
+    return S
+
 
 def pct_color(pct, charging=False):
     """电量色阶：充电中统一用青色；否则 ≥60 绿 / 30-59 黄 / <30 红。"""
@@ -56,10 +74,12 @@ def font(size, weight="normal"):
 class BatteryRing(tk.Canvas):
     """圆环电量表：底槽 + 彩色进度弧 + 中心大号百分比。
 
-    1280x720 屏幕下面板整体控制在 ~400x360 内。
+    尺寸随 ui_theme.S 缩放（96 DPI 基准 148px，150% 屏实为 222px）。
     """
 
     def __init__(self, master, size=132, thickness=13, bg=CARD):
+        size = int(size * S)
+        thickness = max(8, int(thickness * S))
         super().__init__(master, width=size, height=size, bg=bg,
                          highlightthickness=0, bd=0)
         self.size = size
@@ -133,7 +153,7 @@ def flat_button(parent, text, command, kind="normal", width=None):
     else:
         bg, fg, hover = CARD_HI, FG, "#30353F"
     lbl = tk.Label(parent, text=text, bg=bg, fg=fg, font=font(9),
-                   padx=14, pady=6, cursor="hand2")
+                   padx=int(14 * S), pady=int(6 * S), cursor="hand2")
     if width:
         lbl.config(width=width)
     lbl.bind("<Button-1>", lambda _e: command())
@@ -151,6 +171,7 @@ class Toggle(tk.Canvas):
     """iOS 风格开关（替代原生 Checkbutton）。state() 可读当前布尔值。"""
 
     def __init__(self, master, initial=False, command=None, width=40, height=22):
+        width, height = int(width * S), int(height * S)
         super().__init__(master, width=width, height=height, bg=master["bg"],
                          highlightthickness=0, bd=0, cursor="hand2")
         self.w, self.h = width, height
@@ -190,6 +211,7 @@ class Segmented(tk.Canvas):
 
     on_change(索引, 值) 在切换时回调。段间留 8px 间隙（用户反馈太拥挤），
     选中态 = 亮底 + 亮字；未选中 = 透明底 + 暗字。
+    宽度按「字符数 × 单字宽」预估，单字宽随 DPI 缩放（字体会放大，胶囊也要跟着放大）。
     """
 
     def __init__(self, master, options, index=1, on_change=None, gap=8):
@@ -197,18 +219,21 @@ class Segmented(tk.Canvas):
         self.idx = index
         self.on_change = on_change
         bg = master["bg"]
-        # 预估宽度：中文字符约 12px/字 + 左右内边距
-        wpl = [sum(11 if ord(ch) > 0x2E7F else 7 for ch in o) + 16
+        # 预估宽度：中文字符约 11px/字（96 DPI）+ 左右内边距 16px，整体乘 S
+        wpl = [int((sum(11 if ord(ch) > 0x2E7F else 7 for ch in o) + 16) * S)
                for o in self.opts]
+        gap = int(gap * S)
+        h = int(26 * S)
         total = sum(wpl) + gap * (len(self.opts) - 1) + 4
-        super().__init__(master, width=total, height=26, bg=bg,
+        super().__init__(master, width=total, height=h, bg=bg,
                          highlightthickness=0, bd=0)
         self._segs = []
         x = 2
+        y0, y1, ty = int(3 * S), h - int(3 * S), h // 2
         for i, (o, wd) in enumerate(zip(self.opts, wpl)):
-            s = self.create_rectangle(x, 3, x + wd, 22, fill=bg, outline="",
+            s = self.create_rectangle(x, y0, x + wd, y1, fill=bg, outline="",
                                       tags=f"s{i}")
-            t = self.create_text(x + wd / 2, 13, text=o, fill=FG_FAINT,
+            t = self.create_text(x + wd / 2, ty, text=o, fill=FG_FAINT,
                                  font=font(9), tags=f"s{i}")
             self._segs.append((s, t, x, x + wd))
             self.tag_bind(f"s{i}", "<Button-1>",
@@ -261,6 +286,7 @@ class Sparkline(tk.Canvas):
     """迷你电量历史趋势图（最近 N 个采样点，当前色渲染）。"""
 
     def __init__(self, master, width=190, height=34, keep=40):
+        width, height = int(width * S), int(height * S)
         super().__init__(master, width=width, height=height, bg=CARD,
                          highlightthickness=0, bd=0)
         self.w, self.h = width, height

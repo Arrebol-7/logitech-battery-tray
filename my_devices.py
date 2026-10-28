@@ -29,6 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STARTUP_SCRIPT = os.path.join(HERE, "start_tray.pyw")
 DEFAULT_INTERVAL = 60
 MIN_INTERVAL, MAX_INTERVAL = 30, 1800
+MIN_PANEL_WIDTH = 460    # 面板最小逻辑宽度（px @96DPI，随 DPI 缩放）——用户反馈界面太小太挤
 
 # 自动检测：设备清单不再硬编码 —— 插入 2.4G 接收器后按协议识别并自动匹配。
 # 缓存策略：发现结果缓存（避免每轮刷新都做 5s 全扫描）；空结果 10s 过期，
@@ -195,10 +196,23 @@ class Panel:
     def __init__(self):
         import ui_theme as T
         self.T = T
+        # 高分屏清晰 + 像素尺寸随 DPI 等比缩放（用户反馈「界面小且挤」）：
+        # 必须在 tk.Tk() 之前声明 DPI aware —— Tk 在创建时读取屏幕 DPI 定缩放，
+        # 之后再声明就晚了（Tk 内部仍按 96 DPI 布局，系统把整窗拉伸 1.5x，模糊且挤）。
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_AWARE_V2
+        except Exception:                                  # noqa: BLE001 — 已声明/老系统回退
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.resizable(False, False)
         self.root.configure(bg=T.BG)
+        T.set_scaling(self.root)
+        self._s = T.S
         self.result_q = queue.Queue()
         self.cards = {}
         self._busy = False                # 读取互锁：防止并发访问 HID 导致响应错位
@@ -212,25 +226,38 @@ class Panel:
         self.root.after(100, self._pump)
         self.refresh()
 
-    def _center(self):
-        """居中显示（小屏上尤其重要）。"""
+    def _fit(self, center=False):
+        """窗口尺寸贴内容（不小于最小宽度）；center=True 时居中。
+
+        设备卡是异步建的（首扫约 5 秒），建窗那一刻内容还没就绪，
+        所以数据到达后要再收紧一次；平时只改尺寸不挪位置（用户可能拖过窗口）。
+        """
         self.root.update_idletasks()
-        w, h = self.root.winfo_reqwidth(), self.root.winfo_screenheight()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
-        self.root.geometry(f"+{x}+{y}")
+        w = max(self.root.winfo_reqwidth(), int(MIN_PANEL_WIDTH * self._s))
+        h = self.root.winfo_reqheight()
+        if center:
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.root.geometry(f"{w}x{h}")
+
+    def _center(self):
+        """首次显示：按内容定尺寸并居中（小屏上尤其重要）。"""
+        self._fit(center=True)
 
     # ---------------------------------------------------------- 构建界面
     def _build(self):
         T = self.T
-        wrap = tk.Frame(self.root, bg=T.BG, padx=18, pady=16)
+        s = self._s
+        wrap = tk.Frame(self.root, bg=T.BG, padx=int(20 * s), pady=int(18 * s))
         wrap.pack(fill="both", expand=True)
 
         # —— 顶部标题
         head = tk.Frame(wrap, bg=T.BG)
-        head.pack(fill="x", pady=(0, 12))
+        head.pack(fill="x", pady=(0, int(14 * s)))
         tk.Label(head, text="无线外设电量", bg=T.BG, fg=T.FG,
-                 font=T.font(14, "bold")).pack(side="left")
+                 font=T.font(15, "bold")).pack(side="left")
         self.stamp_lbl = tk.Label(head, text="正在检测 2.4G 设备…", bg=T.BG,
                                   fg=T.FG_FAINT, font=T.font(9))
         self.stamp_lbl.pack(side="right")
@@ -242,8 +269,8 @@ class Panel:
 
         # —— 底栏设置（分三组：启动 · 刷新 · 动作，组间留大间距）
         bar = T.Card(wrap)
-        bar.pack(fill="x", pady=(2, 0))
-        opt = tk.Frame(bar.inner, bg=T.CARD, padx=14, pady=10)
+        bar.pack(fill="x", pady=(int(4 * s), 0))
+        opt = tk.Frame(bar.inner, bg=T.CARD, padx=int(16 * s), pady=int(12 * s))
         opt.pack(fill="x")
 
         # §一.5 / 验收 3：开关状态与任务管理器「启动」标签一致。
@@ -252,14 +279,15 @@ class Panel:
                                          command=self._on_autostart_toggle)
         self.autostart_toggle.pack(side="left")
         tk.Label(opt, text="开机自启", bg=T.CARD, fg=T.FG_DIM,
-                 font=T.font(9)).pack(side="left", padx=(7, 0))
+                 font=T.font(9)).pack(side="left", padx=(int(8 * s), 0))
 
         # 组分隔（视觉上断开两组设置）
         tk.Frame(opt, width=1, bg=T.BORDER).pack(side="left", fill="y",
-                                                 padx=(14, 14), pady=2)
+                                                 padx=(int(16 * s), int(16 * s)),
+                                                 pady=2)
 
         tk.Label(opt, text="自动刷新", bg=T.CARD, fg=T.FG_DIM,
-                 font=T.font(9)).pack(side="left", padx=(0, 8))
+                 font=T.font(9)).pack(side="left", padx=(0, int(9 * s)))
         iv_idx = min(2, max(0, self._interval_index()))
         self.interval_seg = T.Segmented(
             opt, ["30 秒", "1 分钟", "5 分钟"], index=iv_idx,
@@ -268,10 +296,11 @@ class Panel:
 
         # 右侧动作按钮组（与左侧设置组用弹性空隙 + 分隔线断开）
         btn_sep = tk.Frame(opt, width=1, bg=T.BORDER)
-        btn_sep.pack(side="right", fill="y", padx=(0, 14), pady=2)
-        T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right", padx=(8, 0))
+        btn_sep.pack(side="right", fill="y", padx=(0, int(16 * s)), pady=2)
+        T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right",
+                                                                 padx=(int(9 * s), 0))
         T.flat_button(opt, "重新检测", lambda: self.refresh(rescan=True),
-                      kind="ghost").pack(side="right", padx=(8, 0))
+                      kind="ghost").pack(side="right", padx=(int(9 * s), 0))
         T.flat_button(opt, "立即刷新", self.refresh, kind="primary").pack(side="right")
 
         self._building = False
@@ -292,28 +321,30 @@ class Panel:
     def _make_card(self, key, title):
         """为设备 key 建一张卡片，返回卡片控件字典。"""
         T = self.T
+        s = self._s
         card = T.Card(self.card_host)
-        card.pack(fill="x", pady=(0, 10))
+        card.pack(fill="x", pady=(0, int(10 * s)))
         body = card.inner
-        inner = tk.Frame(body, bg=T.CARD, padx=16, pady=14)
+        inner = tk.Frame(body, bg=T.CARD, padx=int(18 * s), pady=int(16 * s))
         inner.pack(fill="both", expand=True)
 
-        ring = T.BatteryRing(inner, size=132, thickness=13)
+        # 组件内部已按 DPI 缩放（ui_theme.S），这里传 96-DPI 基准尺寸即可
+        ring = T.BatteryRing(inner, size=148, thickness=14)
         ring.grid(row=0, column=0, rowspan=2)
 
         right = tk.Frame(inner, bg=T.CARD)
-        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(16, 0))
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(int(18 * s), 0))
         inner.columnconfigure(1, weight=1)
 
         tk.Label(right, text=title, bg=T.CARD, fg=T.FG,
-                 font=T.font(12, "bold"), anchor="w").pack(fill="x")
+                 font=T.font(13, "bold"), anchor="w").pack(fill="x")
         title_lbl = right.winfo_children()[-1]
 
         badge = tk.Label(right, text="读取中…", bg=T.CARD, fg=T.FG_DIM,
-                         font=T.font(9), anchor="w")
-        badge.pack(fill="x", pady=(3, 0))
+                         font=T.font(10), anchor="w")
+        badge.pack(fill="x", pady=(int(3 * s), 0))
 
-        T.hline(right).pack(fill="x", pady=(9, 8))
+        T.hline(right).pack(fill="x", pady=(int(10 * s), int(9 * s)))
 
         # —— 指标：只留用户关心的「电池等级」；技术参数（固件/通道）降级成
         #    一行暗色小字，不再和用户信息抢视觉层级（用户反馈太拥挤）。
@@ -322,12 +353,13 @@ class Panel:
         m_level = T.Metric(grid, "电池等级")
         m_level.pack(side="left")
         tech = tk.Label(right, text="", bg=T.CARD, fg=T.FG_FAINT,
-                        font=T.font(8), anchor="w")
-        tech.pack(fill="x", pady=(6, 0))
+                        font=T.font(9), anchor="w")
+        tech.pack(fill="x", pady=(int(7 * s), 0))
 
         # —— 电量趋势（面板开着期间的历史采样）
-        spark = T.Sparkline(right, width=190, height=34)
-        spark.pack(fill="x", pady=(8, 0))
+        # 组件内部已按 DPI 缩放，传 96-DPI 基准尺寸
+        spark = T.Sparkline(right, width=210, height=38)
+        spark.pack(fill="x", pady=(int(9 * s), 0))
 
         c = {"ring": ring, "badge": badge, "spark": spark, "name": title,
              "title": title_lbl, "widget": card,
@@ -473,6 +505,7 @@ class Panel:
 
         self.stamp_lbl.config(text=f"更新于 {time.strftime('%H:%M:%S')}",
                               fg=T.FG_FAINT)
+        self._fit()                      # 卡片建好/移除后收紧窗口（贴合内容）
         self.root.after(self.interval * 1000, self.refresh)
 
     def focus(self):
