@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import tkinter as tk
 
 # ---- 配色 ----------------------------------------------------------------
@@ -135,3 +137,169 @@ def flat_button(parent, text, command, kind="normal", width=None):
     lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover))
     lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
     return lbl
+
+
+# ================================================================= 组件库
+# 下面是本项目自建的深色组件：Toggle 开关、Segmented 分段选择器、
+# Metric 指标块、Sparkline 迷你趋势图。全部纯 tkinter 自绘，
+# 替换原生 ttk 控件（Checkbutton/Combobox 与深色卡片完全不搭）。
+
+class Toggle(tk.Canvas):
+    """iOS 风格开关（替代原生 Checkbutton）。state() 可读当前布尔值。"""
+
+    def __init__(self, master, initial=False, command=None, width=40, height=22):
+        super().__init__(master, width=width, height=height, bg=master["bg"],
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.w, self.h = width, height
+        self.on = initial
+        self.command = command
+        self._track = self.create_oval(1, 1, width - 1, height - 1,
+                                       fill=CARD_HI, outline="")
+        r = (height - 6) / 2
+        cy = height / 2
+        self._knob = self.create_oval(4, cy - r, 4 + 2 * r, cy + r,
+                                      fill=FG_DIM, outline="")
+        self.bind("<Button-1>", self._click)
+        self.set(initial)                 # ⚠ initial 状态必须真正画出来
+
+    def _click(self, _e=None):
+        self.set(not self.on)
+        if self.command:
+            self.command()
+
+    def set(self, on):
+        self.on = bool(on)
+        fill = COLOR_OK if self.on else CARD_HI
+        knob_fill = "#FFFFFF" if self.on else FG_DIM
+        self.itemconfig(self._track, fill=fill)
+        self.itemconfig(self._knob, fill=knob_fill)
+        if self.on:
+            self.move(self._knob, (self.w - 8) - self.coords(self._knob)[0], 0)
+        else:
+            self.move(self._knob, 4 - self.coords(self._knob)[0], 0)
+
+    def state(self):
+        return self.on
+
+
+class Segmented(tk.Canvas):
+    """分段选择器（替代 ttk.Combobox）：一排互斥选项，选中的亮起。
+
+    on_change(索引, 值) 在切换时回调。
+    """
+
+    PADS = ((4, 8), (8, 8), (8, 4))      # (左pad, 右pad) x3 段
+
+    def __init__(self, master, options, index=1, on_change=None):
+        self.opts = list(options)
+        self.idx = index
+        self.on_change = on_change
+        bg = master["bg"]
+        # 预估宽度：中文字符约 12px/字 + pad
+        wpl = [sum(11 if ord(ch) > 0x2E7F else 7 for ch in o)
+               + self.PADS[min(i, 2)][0] + self.PADS[min(i, 2)][1]
+               for i, o in enumerate(self.opts)]
+        total = sum(wpl) + 4
+        super().__init__(master, width=total, height=26, bg=bg,
+                         highlightthickness=0, bd=0)
+        self._segs = []
+        x = 2
+        for i, (o, wd) in enumerate(zip(self.opts, wpl)):
+            s = self.create_rectangle(x, 3, x + wd, 22, fill=bg, outline="",
+                                      tags=f"s{i}")
+            t = self.create_text(x + wd / 2, 13, text=o, fill=FG_DIM,
+                                 font=font(9), tags=f"s{i}")
+            self._segs.append((s, t))
+            self.tag_bind(f"s{i}", "<Button-1>",
+                          lambda _e, k=i: self._pick(k))
+            x += wd
+        self._paint()
+
+    def _paint(self):
+        for i, (s, t) in enumerate(self._segs):
+            if i == self.idx:
+                self.itemconfig(s, fill=CARD_HI)
+                self.itemconfig(t, fill=FG)
+            else:
+                self.itemconfig(s, fill=self.master["bg"])
+                self.itemconfig(t, fill=FG_FAINT)
+
+    def _pick(self, k):
+        if k == self.idx:
+            return
+        self.idx = k
+        self._paint()
+        if self.on_change:
+            self.on_change(k, self.opts[k])
+
+    def set(self, index):
+        self._pick(index) if index != self.idx else None
+
+
+class Metric(tk.Frame):
+    """指标块：小标签 + 数值 + 单位（卡片右侧信息网格用）。"""
+
+    def __init__(self, master, label, value="--", unit="", color=None):
+        super().__init__(master, bg=CARD)
+        tk.Label(self, text=label, bg=CARD, fg=FG_FAINT, font=font(8),
+                 anchor="w").pack(fill="x")
+        row = tk.Frame(self, bg=CARD)
+        row.pack(fill="x")
+        self.val = tk.Label(row, text=value, bg=CARD, fg=color or FG,
+                            font=font(12, "bold"), anchor="w")
+        self.val.pack(side="left")
+        if unit:
+            tk.Label(row, text=unit, bg=CARD, fg=FG_FAINT,
+                     font=font(8)).pack(side="left", padx=(3, 0), pady=(4, 0))
+
+    def set(self, value, color=None, unit=None):
+        self.val.config(text=value, fg=color or FG)
+
+
+class Sparkline(tk.Canvas):
+    """迷你电量历史趋势图（最近 N 个采样点，当前色渲染）。"""
+
+    def __init__(self, master, width=190, height=34, keep=40):
+        super().__init__(master, width=width, height=height, bg=CARD,
+                         highlightthickness=0, bd=0)
+        self.w, self.h = width, height
+        self.keep = keep
+        self.pts = []                     # [(pct, charging)]
+        self._line = None
+        self._area = None
+
+    def push(self, pct, charging=False):
+        """新增一个采样点并重绘。pct 为 None 跳过。"""
+        if pct is None:
+            return
+        self.pts.append((float(pct), charging))
+        if len(self.pts) > self.keep:
+            self.pts = self.pts[-self.keep:]
+        self._draw()
+
+    def _draw(self):
+        for iid in self.find_all():
+            self.delete(iid)
+        if len(self.pts) < 2:
+            tk_lbl = "暂无趋势数据"
+            self.create_text(self.w / 2, self.h / 2, text=tk_lbl,
+                             fill=FG_FAINT, font=font(8))
+            return
+        lo, hi = 0, 100
+        n = len(self.pts)
+        step = self.w / max(n - 1, 1)
+        coords = []
+        for i, (p, _c) in enumerate(self.pts):
+            x = i * step
+            y = self.h - 3 - (p - lo) / (hi - lo) * (self.h - 8)
+            coords += [x, y]
+        color = pct_color(self.pts[-1][0], self.pts[-1][1])
+        self._area = self.create_polygon(
+            coords + [self.w, self.h, 0, self.h],
+            fill=color, stipple="gray25", outline="")
+        self._line = self.create_line(*coords, fill=color, width=2,
+                                      smooth=True)
+        # 末点圆点
+        self.create_oval(coords[-2] - 2.5, coords[-1] - 2.5,
+                         coords[-2] + 2.5, coords[-1] + 2.5,
+                         fill=color, outline="")

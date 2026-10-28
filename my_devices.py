@@ -22,7 +22,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
 
 APP_NAME = "电量托盘"
 APP_TITLE = "无线外设电量"
@@ -247,30 +246,21 @@ class Panel:
         opt = tk.Frame(bar.inner, bg=T.CARD, padx=14, pady=10)
         opt.pack(fill="x")
 
-        # §一.5 / 验收 3：勾选框状态与任务管理器「启动」标签一致。
+        # §一.5 / 验收 3：开关状态与任务管理器「启动」标签一致。
         # §四.7：启动时只 *读* 真实状态，不因为读到不一致就替用户改。
-        self.autostart_var = tk.BooleanVar(value=is_autostart_enabled())
-        self.autostart_cb = tk.Checkbutton(
-            opt, text="开机自启", variable=self.autostart_var,
-            command=self._on_autostart_click, bg=T.CARD, fg=T.FG,
-            activebackground=T.CARD, activeforeground=T.FG,
-            selectcolor=T.CARD_HI, font=T.font(9), bd=0,
-            highlightthickness=0, cursor="hand2")
-        self.autostart_cb.pack(side="left")
+        self.autostart_toggle = T.Toggle(opt, initial=is_autostart_enabled(),
+                                         command=self._on_autostart_toggle)
+        self.autostart_toggle.pack(side="left")
+        tk.Label(opt, text="开机自启", bg=T.CARD, fg=T.FG_DIM,
+                 font=T.font(9)).pack(side="left", padx=(7, 0))
 
-        tk.Label(opt, text="每", bg=T.CARD, fg=T.FG_DIM,
-                 font=T.font(9)).pack(side="left", padx=(18, 5))
-        self.interval_var = tk.StringVar(
-            value=f"{self.interval} 秒" if self.interval < 60
-            else f"{self.interval // 60} 分钟")
-        iv = ttk.Combobox(opt, textvariable=self.interval_var, width=7,
-                          state="readonly", font=T.font(9),
-                          values=["30 秒", "1 分钟", "2 分钟", "5 分钟",
-                                  "10 分钟", "30 分钟"])
-        iv.pack(side="left")
-        iv.bind("<<ComboboxSelected>>", self._on_interval)
         tk.Label(opt, text="自动刷新", bg=T.CARD, fg=T.FG_DIM,
-                 font=T.font(9)).pack(side="left", padx=(5, 0))
+                 font=T.font(9)).pack(side="left", padx=(18, 8))
+        iv_idx = min(2, max(0, self._interval_index()))
+        self.interval_seg = T.Segmented(
+            opt, ["30 秒", "1 分钟", "5 分钟"], index=iv_idx,
+            on_change=self._on_interval_seg)
+        self.interval_seg.pack(side="left")
 
         T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right", padx=(6, 0))
         T.flat_button(opt, "重新检测", lambda: self.refresh(rescan=True),
@@ -278,6 +268,19 @@ class Panel:
         T.flat_button(opt, "立即刷新", self.refresh, kind="primary").pack(side="right")
 
         self._building = False
+
+    def _interval_index(self):
+        """把当前 interval 秒数映射到 Segmented 的档位下标。"""
+        if self.interval <= 30:
+            return 0
+        if self.interval <= 60:
+            return 1
+        return 2
+
+    def _on_interval_seg(self, idx, text):
+        n = int(text.split()[0])
+        self.interval = n * 60 if "分钟" in text else n
+        self.interval = max(MIN_INTERVAL, min(MAX_INTERVAL, self.interval))
 
     def _make_card(self, key, title):
         """为设备 key 建一张卡片，返回卡片控件字典。"""
@@ -303,15 +306,25 @@ class Panel:
                          font=T.font(9), anchor="w")
         badge.pack(fill="x", pady=(3, 0))
 
-        T.hline(right).pack(fill="x", pady=(9, 9))
+        T.hline(right).pack(fill="x", pady=(9, 7))
 
-        detail = tk.Label(right, text="数据来源 —", bg=T.CARD, fg=T.FG_DIM,
-                          font=T.font(8), anchor="w", justify="left",
-                          wraplength=190)
-        detail.pack(fill="x")
+        # —— 指标网格（替代原来的三行灰字）：等级 / 固件 / 槽位
+        grid = tk.Frame(right, bg=T.CARD)
+        grid.pack(fill="x")
+        m_level = T.Metric(grid, "电池等级")
+        m_level.grid(row=0, column=0, sticky="w", padx=(0, 18))
+        m_fw = T.Metric(grid, "接收器固件")
+        m_fw.grid(row=0, column=1, sticky="w", padx=(0, 18))
+        m_src = T.Metric(grid, "读取通道")
+        m_src.grid(row=0, column=2, sticky="w")
 
-        c = {"ring": ring, "badge": badge, "detail": detail, "name": title,
-             "title": title_lbl, "widget": card}
+        # —— 电量趋势（面板开着期间的历史采样）
+        spark = T.Sparkline(right, width=190, height=34)
+        spark.pack(fill="x", pady=(8, 0))
+
+        c = {"ring": ring, "badge": badge, "spark": spark, "name": title,
+             "title": title_lbl, "widget": card,
+             "m_level": m_level, "m_fw": m_fw, "m_src": m_src}
         self.cards[key] = c
         return c
 
@@ -329,9 +342,9 @@ class Panel:
     def _drop_prime(self):
         self._drop_card("_scan")
 
-    def _on_autostart_click(self):
-        """用户主动点勾选框时才写启动项 —— 程序自己绝不擅自改（§四.7）。"""
-        want = self.autostart_var.get()
+    def _on_autostart_toggle(self):
+        """用户主动点开关时才写启动项 —— 程序自己绝不擅自改（§四.7）。"""
+        want = self.autostart_toggle.state()
         have = is_autostart_enabled()
         if want == have:
             return
@@ -341,7 +354,8 @@ class Panel:
             from shell import remove_shortcut
             remove_shortcut(autostart_lnk())
         real = is_autostart_enabled()
-        self.autostart_var.set(real)
+        if real != want:
+            self.autostart_toggle.set(real)      # 写失败时回弹到真实状态
         self.stamp_lbl.config(text=f"开机自启已{'启用' if real else '关闭'}",
                               fg=self.T.FG_DIM)
 
@@ -403,7 +417,9 @@ class Panel:
                 c["ring"].set_color(T.COLOR_UNKNOWN, "--", "休眠")
                 c["badge"].config(text="● 设备未响应 — 检查开关 / 动一下鼠标",
                                   fg=T.COLOR_MID)
-                c["detail"].config(text="设备休眠时不响应请求，唤醒后会自动恢复。")
+                c["m_level"].set("--", T.COLOR_UNKNOWN)
+                c["m_fw"].set("--", T.FG_DIM)
+                c["m_src"].set("--", T.FG_DIM)
             self.stamp_lbl.config(text=f"设备休眠 {time.strftime('%H:%M:%S')}",
                                   fg=T.COLOR_MID)
             self.root.after(self.interval * 1000, self.refresh)
@@ -435,14 +451,11 @@ class Panel:
                 badge_txt = "⚡ " + badge_txt
             c["badge"].config(text=f"● {badge_txt}", fg=color)
 
-            # 明细：说得像人话（"已连接设备 0" 会被误读成"没连上"，实际是
-            # 接收器上报的通道计数，对 GPW2 单设备场景无意义）。
-            lines = [f"读取方式  HID++ 2.0 特性 0x1004（UNIFIED_BATTERY）"
-                     f" · 槽位 {r.get('slot', '?')}",
-                     f"电池等级  {r['level_text']}"]
-            if r.get("firmware"):
-                lines.append(f"接收器固件  {r['firmware']}")
-            c["detail"].config(text="\n".join(lines))
+            # 指标块 + 趋势图
+            c["m_level"].set(r["level_text"], color)
+            c["m_fw"].set(r.get("firmware") or "--", T.FG_DIM)
+            c["m_src"].set(f"0x1004 · 槽{r.get('slot', '?')}", T.FG_DIM)
+            c["spark"].push(pct, charging)
             if c["title"]["text"] != r["name"]:
                 c["title"].config(text=r["name"])
 
