@@ -82,12 +82,15 @@ class BatteryRing(tk.Canvas):
         self._arc = self.create_arc(*box, start=90, extent=0, style="arc",
                                     outline=COLOR_UNKNOWN, width=t)
         cx = cy = s / 2
-        self._pct_text = self.create_text(cx, cy - 2, text="--",
-                                          fill=FG, font=font(int(s * 0.26), "bold"))
-        self._unit_text = self.create_text(cx + s * 0.215, cy + s * 0.055,
+        # 布局留白（用户反馈「太拥挤」）：数字整体上移，% 紧贴数字右侧而非环缘，
+        # 状态字下移到数字与环内缘之间留出呼吸空间。
+        self._pct_text = self.create_text(cx - s * 0.03, cy - s * 0.045,
+                                          text="--", fill=FG,
+                                          font=font(int(s * 0.25), "bold"))
+        self._unit_text = self.create_text(cx + s * 0.17, cy + s * 0.005,
                                            text="%", fill=FG_DIM,
-                                           font=font(int(s * 0.093)))
-        self._sub_text = self.create_text(cx, cy + s * 0.2, text="",
+                                           font=font(int(s * 0.085)))
+        self._sub_text = self.create_text(cx, cy + s * 0.215, text="",
                                           fill=FG_DIM, font=font(9))
 
     def set(self, pct, sub=""):
@@ -185,21 +188,19 @@ class Toggle(tk.Canvas):
 class Segmented(tk.Canvas):
     """分段选择器（替代 ttk.Combobox）：一排互斥选项，选中的亮起。
 
-    on_change(索引, 值) 在切换时回调。
+    on_change(索引, 值) 在切换时回调。段间留 8px 间隙（用户反馈太拥挤），
+    选中态 = 亮底 + 亮字；未选中 = 透明底 + 暗字。
     """
 
-    PADS = ((4, 8), (8, 8), (8, 4))      # (左pad, 右pad) x3 段
-
-    def __init__(self, master, options, index=1, on_change=None):
+    def __init__(self, master, options, index=1, on_change=None, gap=8):
         self.opts = list(options)
         self.idx = index
         self.on_change = on_change
         bg = master["bg"]
-        # 预估宽度：中文字符约 12px/字 + pad
-        wpl = [sum(11 if ord(ch) > 0x2E7F else 7 for ch in o)
-               + self.PADS[min(i, 2)][0] + self.PADS[min(i, 2)][1]
-               for i, o in enumerate(self.opts)]
-        total = sum(wpl) + 4
+        # 预估宽度：中文字符约 12px/字 + 左右内边距
+        wpl = [sum(11 if ord(ch) > 0x2E7F else 7 for ch in o) + 16
+               for o in self.opts]
+        total = sum(wpl) + gap * (len(self.opts) - 1) + 4
         super().__init__(master, width=total, height=26, bg=bg,
                          highlightthickness=0, bd=0)
         self._segs = []
@@ -207,16 +208,16 @@ class Segmented(tk.Canvas):
         for i, (o, wd) in enumerate(zip(self.opts, wpl)):
             s = self.create_rectangle(x, 3, x + wd, 22, fill=bg, outline="",
                                       tags=f"s{i}")
-            t = self.create_text(x + wd / 2, 13, text=o, fill=FG_DIM,
+            t = self.create_text(x + wd / 2, 13, text=o, fill=FG_FAINT,
                                  font=font(9), tags=f"s{i}")
-            self._segs.append((s, t))
+            self._segs.append((s, t, x, x + wd))
             self.tag_bind(f"s{i}", "<Button-1>",
                           lambda _e, k=i: self._pick(k))
-            x += wd
+            x += wd + gap
         self._paint()
 
     def _paint(self):
-        for i, (s, t) in enumerate(self._segs):
+        for i, (s, t, _x0, _x1) in enumerate(self._segs):
             if i == self.idx:
                 self.itemconfig(s, fill=CARD_HI)
                 self.itemconfig(t, fill=FG)

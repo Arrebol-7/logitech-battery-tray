@@ -240,7 +240,7 @@ class Panel:
         self.card_host.pack(fill="both", expand=True)
         self._prime_card()
 
-        # —— 底栏设置
+        # —— 底栏设置（分三组：启动 · 刷新 · 动作，组间留大间距）
         bar = T.Card(wrap)
         bar.pack(fill="x", pady=(2, 0))
         opt = tk.Frame(bar.inner, bg=T.CARD, padx=14, pady=10)
@@ -254,17 +254,24 @@ class Panel:
         tk.Label(opt, text="开机自启", bg=T.CARD, fg=T.FG_DIM,
                  font=T.font(9)).pack(side="left", padx=(7, 0))
 
+        # 组分隔（视觉上断开两组设置）
+        tk.Frame(opt, width=1, bg=T.BORDER).pack(side="left", fill="y",
+                                                 padx=(14, 14), pady=2)
+
         tk.Label(opt, text="自动刷新", bg=T.CARD, fg=T.FG_DIM,
-                 font=T.font(9)).pack(side="left", padx=(18, 8))
+                 font=T.font(9)).pack(side="left", padx=(0, 8))
         iv_idx = min(2, max(0, self._interval_index()))
         self.interval_seg = T.Segmented(
             opt, ["30 秒", "1 分钟", "5 分钟"], index=iv_idx,
             on_change=self._on_interval_seg)
         self.interval_seg.pack(side="left")
 
-        T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right", padx=(6, 0))
+        # 右侧动作按钮组（与左侧设置组用弹性空隙 + 分隔线断开）
+        btn_sep = tk.Frame(opt, width=1, bg=T.BORDER)
+        btn_sep.pack(side="right", fill="y", padx=(0, 14), pady=2)
+        T.flat_button(opt, "退出", self.quit, kind="ghost").pack(side="right", padx=(8, 0))
         T.flat_button(opt, "重新检测", lambda: self.refresh(rescan=True),
-                      kind="ghost").pack(side="right", padx=(6, 0))
+                      kind="ghost").pack(side="right", padx=(8, 0))
         T.flat_button(opt, "立即刷新", self.refresh, kind="primary").pack(side="right")
 
         self._building = False
@@ -306,17 +313,17 @@ class Panel:
                          font=T.font(9), anchor="w")
         badge.pack(fill="x", pady=(3, 0))
 
-        T.hline(right).pack(fill="x", pady=(9, 7))
+        T.hline(right).pack(fill="x", pady=(9, 8))
 
-        # —— 指标网格（替代原来的三行灰字）：等级 / 固件 / 槽位
+        # —— 指标：只留用户关心的「电池等级」；技术参数（固件/通道）降级成
+        #    一行暗色小字，不再和用户信息抢视觉层级（用户反馈太拥挤）。
         grid = tk.Frame(right, bg=T.CARD)
         grid.pack(fill="x")
         m_level = T.Metric(grid, "电池等级")
-        m_level.grid(row=0, column=0, sticky="w", padx=(0, 18))
-        m_fw = T.Metric(grid, "接收器固件")
-        m_fw.grid(row=0, column=1, sticky="w", padx=(0, 18))
-        m_src = T.Metric(grid, "读取通道")
-        m_src.grid(row=0, column=2, sticky="w")
+        m_level.pack(side="left")
+        tech = tk.Label(right, text="", bg=T.CARD, fg=T.FG_FAINT,
+                        font=T.font(8), anchor="w")
+        tech.pack(fill="x", pady=(6, 0))
 
         # —— 电量趋势（面板开着期间的历史采样）
         spark = T.Sparkline(right, width=190, height=34)
@@ -324,7 +331,7 @@ class Panel:
 
         c = {"ring": ring, "badge": badge, "spark": spark, "name": title,
              "title": title_lbl, "widget": card,
-             "m_level": m_level, "m_fw": m_fw, "m_src": m_src}
+             "m_level": m_level, "tech": tech}
         self.cards[key] = c
         return c
 
@@ -418,8 +425,7 @@ class Panel:
                 c["badge"].config(text="● 设备未响应 — 检查开关 / 动一下鼠标",
                                   fg=T.COLOR_MID)
                 c["m_level"].set("--", T.COLOR_UNKNOWN)
-                c["m_fw"].set("--", T.FG_DIM)
-                c["m_src"].set("--", T.FG_DIM)
+                c["tech"].config(text="")
             self.stamp_lbl.config(text=f"设备休眠 {time.strftime('%H:%M:%S')}",
                                   fg=T.COLOR_MID)
             self.root.after(self.interval * 1000, self.refresh)
@@ -436,14 +442,15 @@ class Panel:
             pct, charging = r["percent"], r["charging"]
             color = T.pct_color(pct, charging)
 
-            # 圆环
+            # 圆环（状态不再重复显示：环下 sub 只在休眠等特殊状态出现，
+            # 常规放电/充电中由徽章行表达 —— 用户反馈信息重复拥挤）
             if pct is None:
                 c["ring"].set_color(T.COLOR_UNKNOWN, r["level_text"][:4],
                                     r["state_text"])
             else:
-                c["ring"].set(pct, r["state_text"])
+                c["ring"].set(pct, sub="")
                 if charging:
-                    c["ring"].set_color(color, str(int(pct)), r["state_text"])
+                    c["ring"].set_color(color, str(int(pct)), sub="")
 
             # 状态徽章
             badge_txt = r["state_text"]
@@ -451,10 +458,10 @@ class Panel:
                 badge_txt = "⚡ " + badge_txt
             c["badge"].config(text=f"● {badge_txt}", fg=color)
 
-            # 指标块 + 趋势图
+            # 指标 + 技术参数降级行 + 趋势图
             c["m_level"].set(r["level_text"], color)
-            c["m_fw"].set(r.get("firmware") or "--", T.FG_DIM)
-            c["m_src"].set(f"0x1004 · 槽{r.get('slot', '?')}", T.FG_DIM)
+            c["tech"].config(text=f"固件 {r.get('firmware') or '--'}"
+                                  f"  ·  0x1004 槽{r.get('slot', '?')}")
             c["spark"].push(pct, charging)
             if c["title"]["text"] != r["name"]:
                 c["title"].config(text=r["name"])
